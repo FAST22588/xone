@@ -1,0 +1,80 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+_PROJECT_CONFIG_LIB=/usr/local/lib/nevermore-vpn/project-config.sh
+if [ ! -r "$_PROJECT_CONFIG_LIB" ]; then
+    _PROJECT_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+    [ -r "$_PROJECT_SCRIPT_DIR/../lib/project-config.sh" ] && _PROJECT_CONFIG_LIB="$_PROJECT_SCRIPT_DIR/../lib/project-config.sh"
+fi
+[ -r "$_PROJECT_CONFIG_LIB" ] || { echo "Project config helper is missing; no files were changed." >&2; exit 1; }
+. "$_PROJECT_CONFIG_LIB"
+
+[ "$(id -u)" -eq 0 ] || { echo "Run as root." >&2; exit 1; }
+case "$PROJECT_INSTALL_DIR" in /opt/*) ;; *) echo "Refusing to remove unexpected install path: $PROJECT_INSTALL_DIR" >&2; exit 2 ;; esac
+case "$PROJECT_INSTALL_DIR" in *//*|*/../*|*/..|*/./*|*/.) echo "Refusing an unsafe install path: $PROJECT_INSTALL_DIR" >&2; exit 2 ;; esac
+PROJECT_INSTALL_DIR=$(readlink -m -- "$PROJECT_INSTALL_DIR")
+case "$PROJECT_INSTALL_DIR" in /opt/*) ;; *) echo "Refusing to remove resolved path outside /opt: $PROJECT_INSTALL_DIR" >&2; exit 2 ;; esac
+[ "$PROJECT_INSTALL_DIR" != /opt ] || { echo "Refusing to remove /opt itself." >&2; exit 2; }
+_manifest="${PROJECT_INSTALL_DIR}/current/update/install-manifest.tsv"
+[ -r "$_manifest" ] || { echo "Install manifest is missing; no files were changed." >&2; exit 1; }
+
+cat <<EOF
+This removes the package-managed menu/update commands and UDP Custom service.
+It keeps SSH, VPN account/configuration data, the project config, UDP JSON, and credentials.
+Other legacy VPN services and OS packages are left running/installed.
+A backup of removed commands and source files will be written under /var/backups/nevermore-vpn/.
+EOF
+printf 'Type REMOVE-MENU-AND-UDP to continue: '
+read -r _answer
+[ "$_answer" = REMOVE-MENU-AND-UDP ] || { echo "Cancelled."; exit 0; }
+
+_backup="/var/backups/nevermore-vpn/uninstall-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$_backup/files"
+if [ -r "$PROJECT_CONFIG_DIR/config.env" ]; then
+    cp -p "$PROJECT_CONFIG_DIR/config.env" "$_backup/config.env"
+fi
+if [ -r "$PROJECT_CONFIG_DIR/udp-custom/config.json" ]; then
+    mkdir -p "$_backup/udp-custom"
+    cp -p "$PROJECT_CONFIG_DIR/udp-custom/config.json" "$_backup/udp-custom/config.json"
+fi
+_current_source=$(readlink -f "${PROJECT_INSTALL_DIR}/current" 2>/dev/null || true)
+case "$_current_source" in "${PROJECT_INSTALL_DIR}/releases/"*)
+if [ -d "$_current_source" ]; then
+    tar -czf "$_backup/project-source.tar.gz" -C "$_current_source" .
+fi
+;; esac
+
+systemctl disable --now udp-custom.service udp-custom-firewall.service >/dev/null 2>&1 || true
+if [ -x /usr/local/sbin/udp-custom-firewall ]; then
+    /usr/local/sbin/udp-custom-firewall remove >/dev/null 2>&1 || true
+fi
+rm -f /etc/systemd/system/udp-custom.service /etc/systemd/system/udp-custom-firewall.service
+systemctl daemon-reload || true
+
+for _target in /usr/local/bin/udp-custom /usr/local/sbin/udp-custom-server /usr/local/sbin/udp-custom-firewall; do
+    if [ -f "$_target" ]; then
+        mkdir -p "$_backup/files$(dirname "$_target")"
+        cp -p "$_target" "$_backup/files$_target"
+        rm -f "$_target"
+    fi
+done
+
+while IFS='|' read -r _source _target; do
+    [ -n "$_target" ] || continue
+    case "$_target" in
+        /usr/bin/*|/usr/local/lib/nevermore-vpn/*)
+            if [ -f "$_target" ]; then
+                mkdir -p "$_backup/files$(dirname "$_target")"
+                cp -p "$_target" "$_backup/files$_target"
+                rm -f "$_target"
+            fi
+            ;;
+        *) echo "Skipping unexpected manifest path: $_target" >&2 ;;
+    esac
+done < "$_manifest"
+
+rmdir /usr/local/lib/nevermore-vpn 2>/dev/null || true
+if [ -d "$PROJECT_INSTALL_DIR" ]; then rm -rf "$PROJECT_INSTALL_DIR"; fi
+
+echo "Removed managed menu/UDP runtime files. Configuration and credentials remain at $PROJECT_CONFIG_DIR."
+echo "Backup: $_backup"

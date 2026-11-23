@@ -1,0 +1,122 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+_PROJECT_CONFIG_LIB=/usr/local/lib/nevermore-vpn/project-config.sh
+if [ ! -r "$_PROJECT_CONFIG_LIB" ]; then
+    _PROJECT_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+    [ -r "$_PROJECT_SCRIPT_DIR/../lib/project-config.sh" ] && _PROJECT_CONFIG_LIB="$_PROJECT_SCRIPT_DIR/../lib/project-config.sh"
+fi
+[ -r "$_PROJECT_CONFIG_LIB" ] || { echo "Project config helper is missing." >&2; exit 1; }
+. "$_PROJECT_CONFIG_LIB"
+[ "$(id -u)" -eq 0 ] || { echo "Run as root." >&2; exit 1; }
+
+if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y curl jq ca-certificates
+fi
+
+_DOMAIN=$(cat /etc/xray/domain 2>/dev/null || true)
+[ -n "$_DOMAIN" ] || { echo "Set the Xray domain before installing SlowDNS." >&2; exit 1; }
+mkdir -p /etc/slowdns /var/lib/crot
+
+# Create the DNS names only when no existing SlowDNS domain is configured.
+if [ ! -s /root/nsdomain ]; then
+    _host_script=$(mktemp)
+    if ! curl -fsSL "${SLOWDNS_RAW_BASE}/slowdns/slhostdns.sh" -o "$_host_script"; then
+        rm -f "$_host_script"
+        echo "Could not download the SlowDNS host setup script." >&2
+        exit 1
+    fi
+    if ! bash "$_host_script"; then
+        rm -f "$_host_script"
+        echo "SlowDNS DNS-record setup failed; no existing nameserver file was removed." >&2
+        exit 1
+    fi
+    rm -f "$_host_script"
+fi
+_NAMESERVER=$(cat /root/nsdomain 2>/dev/null || true)
+[ -n "$_NAMESERVER" ] || { echo "SlowDNS nameserver was not created; existing settings were kept." >&2; exit 1; }
+case "$_NAMESERVER" in *[!A-Za-z0-9.-]*) echo "Invalid SlowDNS nameserver value." >&2; exit 1 ;; esac
+
+_download_missing() {
+    _remote=$1
+    _local=$2
+    _mode=$3
+    if [ -s "$_local" ]; then return 0; fi
+    _tmp=$(mktemp)
+    if ! curl -fsSL "${SLOWDNS_RAW_BASE}/slowdns/${_remote}" -o "$_tmp"; then
+        rm -f "$_tmp"
+        echo "Could not download missing SlowDNS file: $_remote" >&2
+        return 1
+    fi
+    install -m "$_mode" "$_tmp" "$_local"
+    rm -f "$_tmp"
+}
+
+_download_missing server.key /etc/slowdns/server.key 0600
+_download_missing server.pub /etc/slowdns/server.pub 0644
+_download_missing sldns-server /etc/slowdns/sldns-server 0755
+_download_missing sldns-client /etc/slowdns/sldns-client 0755
+
+if [ -r /etc/ssh/sshd_config ]; then
+    _sshd_backup=$(mktemp)
+    cp -p /etc/ssh/sshd_config "$_sshd_backup"
+    for _port in 3369 2269; do
+        if ! grep -Eq "^[[:space:]]*Port[[:space:]]+${_port}([[:space:]]|$)" /etc/ssh/sshd_config; then
+            printf 'Port %s\n' "$_port" >> /etc/ssh/sshd_config
+        fi
+    done
+    if command -v sshd >/dev/null 2>&1 && ! sshd -t; then
+        cp -p "$_sshd_backup" /etc/ssh/sshd_config
+        rm -f "$_sshd_backup"
+        echo "SSH config validation failed; the original sshd_config was restored." >&2
+        exit 1
+    fi
+    rm -f "$_sshd_backup"
+    systemctl reload ssh.service >/dev/null 2>&1 || systemctl reload sshd.service >/dev/null 2>&1 || true
+fi
+
+cat > /etc/systemd/system/client-sldns.service <<EOF
+[Unit]
+Description=SlowDNS client service
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/etc/slowdns/sldns-client -udp 8.8.8.8:53 --pubkey-file /etc/slowdns/server.pub ${_NAMESERVER} 127.0.0.1:3369
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/server-sldns.service <<EOF
+[Unit]
+Description=SlowDNS server service
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/etc/slowdns/sldns-server -udp :5300 -privkey-file /etc/slowdns/server.key ${_NAMESERVER} 127.0.0.1:2269
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p udp --dport 5300 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 5300 -j ACCEPT
+    iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+fi
+command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+systemctl daemon-reload
+systemctl enable --now client-sldns.service server-sldns.service
+echo "SlowDNS is configured for ${_NAMESERVER}; existing key files were preserved."

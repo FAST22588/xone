@@ -1,0 +1,27 @@
+#!/bin/bash
+_PROJECT_CONFIG_LIB=/usr/local/lib/nevermore-vpn/project-config.sh
+if [ ! -r "$_PROJECT_CONFIG_LIB" ]; then
+    _PROJECT_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE:-$0}")" 2>/dev/null && pwd)
+    if [ -r "$_PROJECT_SCRIPT_DIR/../lib/project-config.sh" ]; then _PROJECT_CONFIG_LIB="$_PROJECT_SCRIPT_DIR/../lib/project-config.sh"; fi
+fi
+[ -r "$_PROJECT_CONFIG_LIB" ] && . "$_PROJECT_CONFIG_LIB"
+
+#test
+cd
+apt install dnsutils jq -y
+apt-get install net-tools -y
+apt-get install tcpdump -y
+apt-get install dsniff -y
+apt install grepcidr -y
+#install golang
+apt-get install golang -y
+#download scource slowdns plugin
+cd
+wget ${PROJECT_ADDONS_RELEASE_BASE}/download/dnstt-plugin/dnstt-plugin.zip
+unzip plugin.zip
+unzip dnstt-plugin.zip
+cd
+#cd dnstt/dnstt-server
+#go build
+#./dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
+cd
